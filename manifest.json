@@ -1,0 +1,14 @@
+{
+  "id": "br.suaigreja.fundos-por-culto",
+  "name": "Fundos por Culto",
+  "version": "1.8.3",
+  "description": "Seleciona automaticamente imagens ou vídeos de fundo para a Bíblia conforme o culto.",
+  "author": "",
+  "minAppVersion": "0.3.45",
+  "sdk": "0.3.45",
+  "main": "dist/code.js",
+  "ui": "dist/ui/index.html",
+  "permissions": ["outputs:read", "assets:read", "live:read", "live:write", "setlists:read", "ui:read", "ui:write"],
+  "background": true,
+  "panels": [{ "id": "main", "title": "Fundos por Culto", "icon": "image" }]
+}
