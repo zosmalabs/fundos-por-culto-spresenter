@@ -23,15 +23,51 @@ let config: Config = DEFAULT_CONFIG;
 const applying = new Set<string>();
 let lastStatus: Record<string, unknown> = {};
 const liveTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const forceNextOutputs = new Set<string>();
+
+const textValue = (value: unknown, fallback = '') => typeof value === 'string' ? value.trim() : fallback;
+const integerValue = (value: unknown, min: number, max: number, fallback: number) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.trunc(number))) : fallback;
+};
+const validTimeZone = (value: unknown) => {
+  const timeZone = textValue(value, DEFAULT_CONFIG.timeZone);
+  try { new Intl.DateTimeFormat('en-US', { timeZone }).format(); return timeZone; }
+  catch { return DEFAULT_CONFIG.timeZone; }
+};
 
 function mergeConfig(value: Partial<Config> | null | undefined): Config {
+  const profiles = Array.isArray(value?.profiles) ? value.profiles.map((profile: any) => ({
+    id: textValue(profile?.id),
+    name: textValue(profile?.name),
+    assetGuid: textValue(profile?.assetGuid),
+    assetTitle: textValue(profile?.assetTitle) || undefined,
+    assetType: textValue(profile?.assetType) || undefined,
+  })).filter((profile) => profile.id) : [];
+  const profileIds = new Set(profiles.map((profile) => profile.id));
+  const schedules = Array.isArray(value?.schedules) ? value.schedules.map((schedule: any, index) => ({
+    id: textValue(schedule?.id, `schedule-${index}`),
+    name: textValue(schedule?.name, 'Culto'),
+    weekday: integerValue(schedule?.weekday, 0, 6, 0),
+    time: /^([01]\d|2[0-3]):[0-5]\d$/.test(textValue(schedule?.time)) ? textValue(schedule.time) : '19:30',
+    profileId: profileIds.has(textValue(schedule?.profileId)) ? textValue(schedule.profileId) : '',
+    beforeMinutes: integerValue(schedule?.beforeMinutes, 0, 1440, 90),
+    durationMinutes: integerValue(schedule?.durationMinutes, 1, 1440, 330),
+    enabled: schedule?.enabled !== false,
+  })) : DEFAULT_CONFIG.schedules.map((schedule) => ({ ...schedule }));
+  const setlistMappings = Array.isArray(value?.setlistMappings) ? value.setlistMappings.map((mapping: any) => ({
+    setlistId: textValue(mapping?.setlistId),
+    setlistName: textValue(mapping?.setlistName),
+    profileId: textValue(mapping?.profileId),
+  })).filter((mapping) => mapping.setlistId && profileIds.has(mapping.profileId)) : [];
+  const manualProfileId = textValue(value?.manualProfileId);
   return {
-    ...DEFAULT_CONFIG,
-    ...(value ?? {}),
-    profiles: Array.isArray(value?.profiles) ? value!.profiles.map((p: any) => ({ id: p.id, name: p.name, assetGuid: p.assetGuid ?? '', assetTitle: p.assetTitle, assetType: p.assetType })) : [],
-    schedules: Array.isArray(value?.schedules) ? value!.schedules : DEFAULT_CONFIG.schedules,
-    setlistMappings: Array.isArray(value?.setlistMappings) ? value!.setlistMappings : [],
+    profiles,
+    schedules,
+    setlistMappings,
+    manualProfileId: profileIds.has(manualProfileId) ? manualProfileId : null,
+    bibleLayer: integerValue(value?.bibleLayer, 0, 99, DEFAULT_CONFIG.bibleLayer),
+    backgroundLayer: integerValue(value?.backgroundLayer, 0, 99, DEFAULT_CONFIG.backgroundLayer),
+    timeZone: validTimeZone(value?.timeZone),
   };
 }
 
@@ -75,9 +111,13 @@ async function activeSelection() {
 
 function looksLikeBible(presentation: any) {
   if (!presentation) return false;
-  const values = [presentation.asset?.type, presentation.asset?.category, presentation.asset?.title, presentation.title, presentation.props?.type, presentation.props?.source, presentation.props?.contentType]
-    .filter(Boolean).map((v) => String(v).toLowerCase());
-  return values.some((v) => /b[ií]bl|bible|scripture|vers[ií]culo|verse/.test(v));
+  const exactTypes = [presentation.type, presentation.asset?.type, presentation.props?.type, presentation.props?.contentType]
+    .filter(Boolean).map((value) => String(value).toLowerCase());
+  if (exactTypes.includes('bible')) return true;
+  // Compatibilidade com versões antigas que não informavam asset.type.
+  const legacyValues = [presentation.asset?.category, presentation.props?.source]
+    .filter(Boolean).map((value) => String(value).toLowerCase());
+  return legacyValues.some((value) => /b[ií]bl|bible|scripture/.test(value));
 }
 
 async function sendStatus(extra: Record<string, unknown> = {}) {
@@ -99,31 +139,16 @@ async function getMedia(query = '') {
   return [...unique.values()].sort((a, b) => String(a.title ?? '').localeCompare(String(b.title ?? ''), 'pt-BR'));
 }
 
-function setlistArray(value: any): any[] {
-  if (Array.isArray(value)) return value;
-  if (!value || typeof value !== 'object') return [];
-  for (const key of ['setlists', 'events', 'items', 'data', 'files', 'results']) if (Array.isArray(value[key])) return value[key];
-  return [];
-}
-
-function normalizeSetlists(value: any) {
-  return setlistArray(value).map((item: any, index: number) => {
-    const source = item && typeof item === 'object' ? item : { name: String(item) };
-    const id = String(source.id ?? source.guid ?? source.setlistId ?? source.fileId ?? source.path ?? source.name ?? source.title ?? index);
-    const name = String(source.name ?? source.title ?? source.label ?? source.fileName ?? source.filename ?? id);
-    return { ...source, id, name };
-  }).filter((item: any) => item.id);
-}
-
 async function getSavedSetlists() {
-  const errors: string[] = [];
-  const found = new Map<string, any>();
-  const readers: Array<[string, () => Promise<any>]> = [['setlists.list', () => spresenter.setlists.list()], ['events.list', () => spresenter.events.list()]];
-  for (const [label, read] of readers) {
-    try { normalizeSetlists(await read()).forEach((item: any) => found.set(item.id, item)); }
-    catch (error) { errors.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+  try {
+    const saved = await spresenter.setlists.list();
+    const setlists = saved.map((item: any) => ({ ...item, id: String(item.id), name: String(item.title ?? item.name ?? item.id) }))
+      .filter((item) => item.id)
+      .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+    return { setlists, info: setlists.length ? `${setlists.length} setlist(s) encontrada(s).` : 'O Spresenter retornou uma lista vazia.' };
+  } catch (error) {
+    return { setlists: [], info: `Não foi possível consultar as setlists: ${error instanceof Error ? error.message : String(error)}` };
   }
-  return { setlists: [...found.values()].sort((a, b) => String(a.name).localeCompare(String(b.name), 'pt-BR')), info: found.size ? `${found.size} setlist(s) encontrada(s).` : errors.length ? errors.join(' | ') : 'O Spresenter retornou uma lista vazia.' };
 }
 
 async function applyBackground(output: string, force = false) {
@@ -138,12 +163,24 @@ async function applyBackground(output: string, force = false) {
     if (!profile?.assetGuid) { await sendStatus({ lastDiagnostic: diagnostic, lastAction: 'Nenhuma imagem ou vídeo ativo para este horário.' }); return; }
     const asset = await spresenter.assets.get(profile.assetGuid);
     if (!asset) { await sendStatus({ lastDiagnostic: diagnostic, lastAction: `Mídia do perfil “${profile.name}” não encontrada.` }); return; }
-    await spresenter.live.setState(output, config.backgroundLayer, { show: true, opacity: 1 });
     const currentBackground = live[config.backgroundLayer];
-    const mustForce = force || forceNextOutputs.has(output);
-    if (!mustForce && currentBackground?.asset?.guid === asset.guid) { await sendStatus({ lastDiagnostic: diagnostic, lastAction: `Fundo “${profile.name}” já está aplicado.` }); return; }
-    await spresenter.live.apply(output, config.backgroundLayer, { title: profile.name, asset });
-    forceNextOutputs.delete(output);
+    const states: any[] = await spresenter.live.readState(output);
+    const backgroundState: any = states[config.backgroundLayer];
+    const alreadyApplied = currentBackground?.asset?.guid === asset.guid;
+    const alreadyVisible = backgroundState?.show === true && Number(backgroundState?.opacity) === 1;
+    if (!force && alreadyApplied && alreadyVisible) { await sendStatus({ lastDiagnostic: diagnostic, lastAction: `Fundo “${profile.name}” já está aplicado.` }); return; }
+    if (force || !alreadyApplied) await spresenter.live.apply(output, config.backgroundLayer, { title: profile.name, asset });
+    if (force || !alreadyVisible) await spresenter.live.setState(output, config.backgroundLayer, { show: true, opacity: 1 });
+
+    const [confirmedLive, confirmedStates] = await Promise.all([
+      spresenter.live.read(output),
+      spresenter.live.readState(output),
+    ]);
+    const confirmedBackground: any = confirmedLive[config.backgroundLayer];
+    const confirmedState: any = confirmedStates[config.backgroundLayer];
+    if (confirmedBackground?.asset?.guid !== asset.guid || confirmedState?.show !== true || Number(confirmedState?.opacity) !== 1) {
+      throw new Error('O Spresenter não confirmou o fundo ou a ativação da camada.');
+    }
     await sendStatus({ lastDiagnostic: diagnostic, lastAction: `Fundo “${profile.name}” aplicado (${source}).` });
   } catch (error) {
     await sendStatus({ lastAction: `Erro: ${error instanceof Error ? error.message : String(error)}` });
@@ -187,23 +224,9 @@ spresenter.ui.onmessage = async (raw: unknown) => {
 };
 
 spresenter.on('live', ({ output }) => { scheduleApply(String(output ?? '0')); });
+spresenter.on('state', ({ output }) => { scheduleApply(String(output ?? '0')); });
 void ready.then(async () => {
   await sendStatus({ lastAction: 'Plugin iniciado.' });
   const outputs = await spresenter.outputs.list();
-  outputs.forEach((item) => { const id = String(item.index); forceNextOutputs.add(id); scheduleApply(id, 650); });
-  setTimeout(async () => {
-    try {
-      const panelId = `plugin:${spresenter.manifest.id}:main`;
-      const { panels } = await spresenter.panels.list();
-      const panel = panels.find((item) => item.id === panelId);
-      if (!panel?.open) return;
-      const wasFloating = panel.location === 'floating';
-      await spresenter.panels.close(panelId);
-      const reopened = await spresenter.panels.open(panelId, wasFloating ? { float: true } : undefined);
-      if (panel.location === 'grid' && reopened.location !== 'grid') await spresenter.panels.dock(panelId);
-      await spresenter.panels.select(panelId);
-    } catch (error) {
-      console.warn('Não foi possível atualizar o painel restaurado:', error);
-    }
-  }, 1800);
+  outputs.forEach((item) => scheduleApply(String(item.index), 650));
 });
